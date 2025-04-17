@@ -125,6 +125,65 @@ static bool writeToCgroup(
 }
 
 static void removeCgroup(const std::string &cgroup_path) {
+	long long memory_peak_bytes = -1;  // Initialize to -1 (error/not found)
+	long long user_usec = -1;
+	long long system_usec = -1;
+	long long total_cpu_usec = -1;
+
+	// 1. Read memory.peak
+	std::string mem_peak_path = cgroup_path + "/memory.peak";
+	FILE *fp_mem = fopen(mem_peak_path.c_str(), "r");
+	if (fp_mem != NULL) {
+		if (fscanf(fp_mem, "%lld", &memory_peak_bytes) != 1) {
+			memory_peak_bytes = -1;	 // Indicate parsing error
+						 // Optional: Log parsing warning
+			// LOG_W("Could not parse memory.peak content from %s",
+			// mem_peak_path.c_str());
+		}
+		fclose(fp_mem);
+	} else {
+		// Optional: Log file open warning if errno is not ENOENT (file not found)
+		// if (errno != ENOENT) {
+		//     PLOG_W("Could not open %s", mem_peak_path.c_str());
+		// }
+	}
+
+	// 2. Read cpu.stat
+	std::string cpu_stat_path = cgroup_path + "/cpu.stat";
+	FILE *fp_cpu = fopen(cpu_stat_path.c_str(), "r");
+	if (fp_cpu != NULL) {
+		char line[256];
+		while (fgets(line, sizeof(line), fp_cpu) != NULL) {
+			if (strncmp(line, "user_usec ", 10) == 0) {
+				// Found user_usec, parse the value after the space
+				user_usec = strtoll(line + 10, NULL, 10);
+			} else if (strncmp(line, "system_usec ", 12) == 0) {
+				// Found system_usec, parse the value after the space
+				system_usec = strtoll(line + 12, NULL, 10);
+			}
+			// Optimization: if both found, stop reading
+			if (user_usec != -1 && system_usec != -1) {
+				break;
+			}
+		}
+		fclose(fp_cpu);
+
+		// Calculate total if both were found successfully
+		if (user_usec != -1 && system_usec != -1) {
+			total_cpu_usec = user_usec + system_usec;
+		}
+	} else {
+		// Optional: Log file open warning
+		// if (errno != ENOENT) {
+		//     PLOG_W("Could not open %s", cpu_stat_path.c_str());
+		// }
+	}
+
+	// 3. Log the collected statistics using nsjail's logging
+	//    Use LOG_I for informational, or LOG_D for debug level.
+	LOG_I("Cgroup Stats: CPU_usec=%lld MEM_peak_bytes=%lld (user=%lld, system=%lld)",
+	    total_cpu_usec, memory_peak_bytes, user_usec, system_usec);
+
 	LOG_D("Remove '%s'", cgroup_path.c_str());
 	if (rmdir(cgroup_path.c_str()) == -1) {
 		PLOG_W("rmdir('%s') failed", cgroup_path.c_str());
