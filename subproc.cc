@@ -236,6 +236,9 @@ static void addProc(nsjconf_t* nsjconf, pid_t pid, int sock) {
 	pids_t p;
 
 	p.start = time(NULL);
+	if (p.start == (time_t)-1) {
+		PLOG_E("CRITICAL: time(NULL) failed when recording start time for pid=%d.", pid);
+	}
 	p.remote_txt = net::connToText(sock, /* remote= */ true, &p.remote_addr);
 
 	char fname[PATH_MAX];
@@ -383,12 +386,23 @@ int reapProc(nsjconf_t* nsjconf) {
 	}
 
 	time_t now = time(NULL);
+	if (now == (time_t)-1) {
+		PLOG_W("time(NULL) failed when checking timeouts. Skipping timeout checks for this "
+		       "cycle.");
+		return rv;
+	}
 	for (const auto& p : nsjconf->pids) {
 		if (nsjconf->tlimit == 0) {
 			continue;
 		}
 		pid_t pid = p.first;
-		time_t diff = now - p.second.start;
+		long long _diff = (long long)now - (long long)p.second.start;
+		if (_diff < 0) {
+			LOG_W("pid=%d start time is in the future, start time: %ld, now: %ld", pid,
+			    (long)p.second.start, (long)now);
+			continue;
+		}
+		time_t diff = (time_t)_diff;
 		if ((uint64_t)diff >= nsjconf->tlimit) {
 			LOG_I("pid=%d run time >= time limit (%ld >= %" PRIu64 ") (%s). Killing it",
 			    pid, (long)diff, nsjconf->tlimit, p.second.remote_txt.c_str());
