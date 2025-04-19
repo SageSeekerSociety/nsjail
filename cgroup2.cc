@@ -32,10 +32,6 @@
 #include <sys/vfs.h>
 #include <unistd.h>
 
-#include <fstream>
-#include <iostream>
-#include <sstream>
-
 #include "logs.h"
 #include "util.h"
 
@@ -125,58 +121,201 @@ static bool writeToCgroup(
 }
 
 static void removeCgroup(const std::string &cgroup_path) {
-	long long memory_peak_bytes = -1;  // Initialize to -1 (error/not found)
+	long long memory_peak_bytes = -1;
 	long long user_usec = -1;
 	long long system_usec = -1;
 	long long total_cpu_usec = -1;
 
-	// 1. Read memory.peak
-	std::string mem_peak_path = cgroup_path + "/memory.peak";
-	FILE *fp_mem = fopen(mem_peak_path.c_str(), "r");
+	// 1. Read memory.peak using C stdio
+	std::string mem_peak_path_str = cgroup_path + "/memory.peak";
+	const char *mem_peak_path = mem_peak_path_str.c_str();
+	FILE *fp_mem = fopen(mem_peak_path, "r");
 	if (fp_mem != NULL) {
-		if (fscanf(fp_mem, "%lld", &memory_peak_bytes) != 1) {
-			memory_peak_bytes = -1;	 // Indicate parsing error
-						 // Optional: Log parsing warning
-			// LOG_W("Could not parse memory.peak content from %s",
-			// mem_peak_path.c_str());
+		char mem_buf[64];  // Buffer to read the number string
+		if (fgets(mem_buf, sizeof(mem_buf), fp_mem) != NULL) {
+			char *endptr = NULL;
+			errno = 0;  // Reset errno before strtoll
+			long long val = strtoll(mem_buf, &endptr, 10);
+
+			// Check for conversion errors
+			if (errno == ERANGE) {
+				PLOG_W(
+				    "Value in '%s' is out of range for long long", mem_peak_path);
+				memory_peak_bytes = -1;
+			} else if (errno != 0 && val == 0) {
+				PLOG_W("Error converting value in '%s'", mem_peak_path);
+				memory_peak_bytes = -1;
+			} else if (endptr == mem_buf) {
+				LOG_W("No numerical digits found in '%s'. Content starting with: "
+				      "'%.10s'",
+				    mem_peak_path, mem_buf);
+				memory_peak_bytes = -1;
+			} else {
+				char *check_ptr = endptr;
+				while (*check_ptr != '\0' && isspace((unsigned char)*check_ptr)) {
+					check_ptr++;
+				}
+				if (*check_ptr != '\0') {
+					LOG_W("Extra non-numeric/non-whitespace characters found "
+					      "after number in '%s'. Content: '%.20s'",
+					    mem_peak_path, mem_buf);
+					memory_peak_bytes = -1;
+				} else if (val < 0) {
+					LOG_W("Parsed negative memory peak value from '%s': %lld",
+					    mem_peak_path, val);
+					memory_peak_bytes = -1;
+				} else {
+					memory_peak_bytes = val;  // Success
+				}
+			}
+		} else {
+			if (feof(fp_mem)) {
+				LOG_W("File '%s' is empty.", mem_peak_path);
+			} else {  // ferror(fp_mem) must be true
+				PLOG_W("Error reading from file '%s'", mem_peak_path);
+			}
+			memory_peak_bytes = -1;
 		}
 		fclose(fp_mem);
 	} else {
-		// Optional: Log file open warning if errno is not ENOENT (file not found)
-		// if (errno != ENOENT) {
-		//     PLOG_W("Could not open %s", mem_peak_path.c_str());
-		// }
+		if (errno == ENOENT) {
+			LOG_D("File '%s' not found (errno=%d). Cgroup might have been removed.",
+			    mem_peak_path, errno);
+		} else {
+			PLOG_W("Failed to open file '%s'", mem_peak_path);
+		}
+		// memory_peak_bytes remains -1
 	}
 
-	// 2. Read cpu.stat
-	std::string cpu_stat_path = cgroup_path + "/cpu.stat";
-	FILE *fp_cpu = fopen(cpu_stat_path.c_str(), "r");
+	// 2. Read cpu.stat using C stdio
+	std::string cpu_stat_path_str = cgroup_path + "/cpu.stat";
+	const char *cpu_stat_path = cpu_stat_path_str.c_str();
+	FILE *fp_cpu = fopen(cpu_stat_path, "r");
 	if (fp_cpu != NULL) {
 		char line[256];
 		while (fgets(line, sizeof(line), fp_cpu) != NULL) {
-			if (strncmp(line, "user_usec ", 10) == 0) {
-				// Found user_usec, parse the value after the space
-				user_usec = strtoll(line + 10, NULL, 10);
-			} else if (strncmp(line, "system_usec ", 12) == 0) {
-				// Found system_usec, parse the value after the space
-				system_usec = strtoll(line + 12, NULL, 10);
+			if (user_usec == -1 && strncmp(line, "user_usec ", 10) ==
+						   0) {	 // Process only if not already found
+				char *value_ptr = line + 10;
+				char *endptr = NULL;
+				errno = 0;
+				long long val = strtoll(value_ptr, &endptr, 10);
+
+				if (errno == ERANGE) {
+					PLOG_W("user_usec value out of range in '%s'. Line: '%s'",
+					    cpu_stat_path, line);
+					user_usec = -2;
+				}  // Use -2 to distinguish parse error from not found? Or just keep
+				   // -1.
+				else if (errno != 0 && val == 0) {
+					PLOG_W("Error converting user_usec in '%s'. Line: '%s'",
+					    cpu_stat_path, line);
+					user_usec = -1;
+				} else if (endptr == value_ptr) {
+					LOG_W("No numerical digits found for user_usec in '%s'. "
+					      "Line: '%s'",
+					    cpu_stat_path, line);
+					user_usec = -1;
+				} else {
+					char *check_ptr = endptr;
+					while (*check_ptr != '\0' &&
+					       isspace((unsigned char)*check_ptr))
+						check_ptr++;
+					if (*check_ptr != '\0') {
+						LOG_W("Extra chars after user_usec value in '%s'. "
+						      "Line: '%s'",
+						    cpu_stat_path, line);
+						user_usec = -1;
+					} else if (val < 0) {
+						LOG_W("Parsed negative user_usec value from '%s': "
+						      "%lld",
+						    cpu_stat_path, val);
+						user_usec = -1;
+					} else {
+						user_usec = val;
+					}  // Success
+				}
+			} else if (system_usec == -1 &&
+				   strncmp(line, "system_usec ", 12) ==
+				       0) {  // Process only if not already found
+				char *value_ptr = line + 12;
+				char *endptr = NULL;
+				errno = 0;
+				long long val = strtoll(value_ptr, &endptr, 10);
+
+				if (errno == ERANGE) {
+					PLOG_W("system_usec value out of range in '%s'. Line: '%s'",
+					    cpu_stat_path, line);
+					system_usec = -1;
+				} else if (errno != 0 && val == 0) {
+					PLOG_W("Error converting system_usec in '%s'. Line: '%s'",
+					    cpu_stat_path, line);
+					system_usec = -1;
+				} else if (endptr == value_ptr) {
+					LOG_W("No numerical digits for system_usec in '%s'. Line: "
+					      "'%s'",
+					    cpu_stat_path, line);
+					system_usec = -1;
+				} else {
+					char *check_ptr = endptr;
+					while (*check_ptr != '\0' &&
+					       isspace((unsigned char)*check_ptr))
+						check_ptr++;
+					if (*check_ptr != '\0') {
+						LOG_W("Extra chars after system_usec value in "
+						      "'%s'. Line: '%s'",
+						    cpu_stat_path, line);
+						system_usec = -1;
+					} else if (val < 0) {
+						LOG_W("Parsed negative system_usec value from "
+						      "'%s': %lld",
+						    cpu_stat_path, val);
+						system_usec = -1;
+					} else {
+						system_usec = val;
+					}  // Success
+				}
 			}
-			// Optimization: if both found, stop reading
+
+			// Optimization: if both valid values found, stop reading
 			if (user_usec != -1 && system_usec != -1) {
 				break;
 			}
+		}  // end while fgets
+
+		if (ferror(fp_cpu)) {  // Check if loop terminated due to read error
+			PLOG_W("Error occurred while reading '%s'", cpu_stat_path);
+			// If an error occurred mid-read, already found values might be suspect?
+			// For simplicity, keep them, but total will likely remain -1 if one is
+			// missing.
 		}
 		fclose(fp_cpu);
 
-		// Calculate total if both were found successfully
-		if (user_usec != -1 && system_usec != -1) {
+		// Calculate total only if both components were successfully parsed and are
+		// non-negative
+		if (user_usec >= 0 && system_usec >= 0) {
 			total_cpu_usec = user_usec + system_usec;
+		} else {
+			// Log if we couldn't get both valid CPU times (and at least one wasn't just
+			// missing due to early exit)
+			if (user_usec == -1 || system_usec == -1) {
+				LOG_W("Could not determine total CPU usage from '%s' "
+				      "(user_usec=%lld, system_usec=%lld)",
+				    cpu_stat_path, user_usec, system_usec);
+			}
+			total_cpu_usec =
+			    -1;	 // Ensure total is -1 if components are invalid or missing
 		}
+
 	} else {
-		// Optional: Log file open warning
-		// if (errno != ENOENT) {
-		//     PLOG_W("Could not open %s", cpu_stat_path.c_str());
-		// }
+		// fopen failed for cpu.stat
+		if (errno == ENOENT) {
+			LOG_D("File '%s' not found (errno=%d). Cgroup might have been removed.",
+			    cpu_stat_path, errno);
+		} else {
+			PLOG_W("Failed to open file '%s'", cpu_stat_path);
+		}
+		// Values remain -1
 	}
 
 	// 3. Log the collected statistics using nsjail's logging
