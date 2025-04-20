@@ -1,0 +1,72 @@
+name: Build Nsjail Docker Image
+
+on:
+  push:
+    branches: ["master"] # Trigger on push to master branch
+    tags: ["v*.*.*"] # Trigger on tags like v1.0.0
+  pull_request:
+    branches: ["master"] # Build on PRs targeting master (optional, can remove push: false)
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  build-and-push-nsjail:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Read repo content
+      packages: write # Write packages (Docker images) to GHCR
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set Environment Variables # Define registry and image name
+        run: |
+          echo "REGISTRY=ghcr.io" >> "$GITHUB_ENV"
+          # Use the actual GitHub organization/user and repo name
+          echo "IMAGE_NAME=${{ github.repository_owner }}/nsjail" >> "$GITHUB_ENV"
+        # Note: github.repository_owner might need adjustment if it's an organization vs user repo
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta for nsjail # Extract tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Generate tags:
+          # - latest on default branch (master)
+          # - version tag (e.g., v1.2.3) if git tag pushed
+          # - commit sha tag
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix=,suffix=,format=short
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Nsjail image
+        uses: docker/build-push-action@v6
+        with:
+          context: . # Context is the repo root
+          file: ./.docker/nsjail.Dockerfile # Path to the Dockerfile
+          # Only push images for master branch commits and tags
+          # For PRs, it will just build and cache (push: false implicit for PRs)
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Pass build arguments (optional, can override defaults in Dockerfile)
+          build-args: |
+            BASE_IMAGE=openjdk:25-jdk-slim
+            NSJAIL_REPO=https://github.com/${{ github.repository_owner }}/nsjail.git
+            # Use GITHUB_REF_NAME which holds branch or tag name
+            NSJAIL_REF=${{ github.ref_name }}
