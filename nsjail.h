@@ -53,6 +53,8 @@ struct pids_t {
 	std::string remote_txt;
 	struct sockaddr_in6 remote_addr;
 	int pid_syscall_fd;
+	uint64_t cpu_rl_cur = /* RLIM64_INFINITY */ (~0ULL);
+	uint64_t cpu_rl_max = /* RLIM64_INFINITY */ (~0ULL);
 };
 
 struct mount_t {

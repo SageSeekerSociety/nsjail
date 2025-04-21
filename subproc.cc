@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -245,6 +246,12 @@ static void addProc(nsjconf_t* nsjconf, pid_t pid, int sock) {
 	snprintf(fname, sizeof(fname), "/proc/%d/syscall", (int)pid);
 	p.pid_syscall_fd = TEMP_FAILURE_RETRY(open(fname, O_RDONLY | O_CLOEXEC));
 
+	// Store the configured CPU limits from nsjconf if rlimits are not disabled.
+	if (!nsjconf->disable_rl) {
+		p.cpu_rl_cur = nsjconf->rl_cpu;	 // containSetLimits sets both cur and max to this
+		p.cpu_rl_max = nsjconf->rl_cpu;
+	}  // Otherwise, they remain RLIM64_INFINITY
+
 	if (nsjconf->pids.find(pid) != nsjconf->pids.end()) {
 		LOG_F("pid=%d already exists", pid);
 	}
@@ -336,20 +343,43 @@ static void seccompViolation(nsjconf_t* nsjconf, siginfo_t* si) {
 
 static int reapProc(nsjconf_t* nsjconf, pid_t pid, bool should_wait = false) {
 	int status;
+	struct rusage usage;
 
-	if (wait4(pid, &status, should_wait ? 0 : WNOHANG, NULL) == pid) {
+	// Find the process info and retrieve stored limits *before* waiting.
+	auto p_iter = nsjconf->pids.find(pid);
+	std::string remote_txt = "[UNKNOWN]";
+	uint64_t stored_cpu_rl_cur = RLIM64_INFINITY;
+	uint64_t stored_cpu_rl_max = RLIM64_INFINITY;
+
+	if (p_iter != nsjconf->pids.end()) {
+		remote_txt = p_iter->second.remote_txt;
+		stored_cpu_rl_cur = p_iter->second.cpu_rl_cur;
+		stored_cpu_rl_max = p_iter->second.cpu_rl_max;
+		// Log the configured limits. This ensures the info is logged even if wait4 fails
+		// later.
+		LOG_I("pid=%d Configured RLIMIT_CPU: cur=%llu, max=%llu", pid,
+		    (unsigned long long)stored_cpu_rl_cur, (unsigned long long)stored_cpu_rl_max);
+	} else {
+		// This case should ideally not happen if waitid/wait4 reports a PID.
+		LOG_W("pid=%d not found in tracked process map during reap.", pid);
+	}
+
+	// Wait for the process and get usage statistics.
+	if (wait4(pid, &status, should_wait ? 0 : WNOHANG, &usage) == pid) {
+		double user_sec = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6;
+		double sys_sec = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6;
+		double tot_sec = user_sec + sys_sec;
+		LOG_I("pid=%d CPU usage -> user: %.6fs, sys: %.6fs, total: %.6fs", pid, user_sec,
+		    sys_sec, tot_sec);
+
+		// Perform cgroup cleanup.
 		if (nsjconf->use_cgroupv2) {
 			cgroup2::finishFromParent(nsjconf, pid);
 		} else {
 			cgroup::finishFromParent(nsjconf, pid);
 		}
 
-		std::string remote_txt = "[UNKNOWN]";
-		const auto& p = nsjconf->pids.find(pid);
-		if (p != nsjconf->pids.end()) {
-			remote_txt = p->second.remote_txt;
-		}
-
+		// Handle process exit or termination.
 		if (WIFEXITED(status)) {
 			LOG_I("pid=%d (%s) exited with status: %d, (PIDs left: %d)", pid,
 			    remote_txt.c_str(), WEXITSTATUS(status), countProc(nsjconf) - 1);
@@ -357,12 +387,43 @@ static int reapProc(nsjconf_t* nsjconf, pid_t pid, bool should_wait = false) {
 			return WEXITSTATUS(status);
 		}
 		if (WIFSIGNALED(status)) {
-			LOG_I("pid=%d (%s) terminated with signal: %s (%d), (PIDs left: %d)", pid,
-			    remote_txt.c_str(), util::sigName(WTERMSIG(status)).c_str(),
-			    WTERMSIG(status), countProc(nsjconf) - 1);
+			int sig = WTERMSIG(status);
+			if (sig == SIGXCPU) {
+				LOG_I("pid=%d (%s) killed: CPU soft limit exceeded (SIGXCPU), "
+				      "(PIDs left: %d)",
+				    pid, remote_txt.c_str(), countProc(nsjconf) - 1);
+			} else if (sig == SIGKILL) {
+				// Check if SIGKILL was potentially due to the hard CPU limit using
+				// the stored max value.
+				if (stored_cpu_rl_max != RLIM64_INFINITY &&
+				    tot_sec >= (double)stored_cpu_rl_max) {
+					LOG_I("pid=%d (%s) killed: CPU hard limit exceeded "
+					      "(SIGKILL), "
+					      "used=%.3fs, hard_limit=%llus, (PIDs left: %d)",
+					    pid, remote_txt.c_str(), tot_sec,
+					    (long long)stored_cpu_rl_max, countProc(nsjconf) - 1);
+				} else {
+					// Log generic SIGKILL if not clearly due to CPU hard limit.
+					LOG_I("pid=%d (%s) killed by SIGKILL, (PIDs left: %d)", pid,
+					    remote_txt.c_str(), countProc(nsjconf) - 1);
+				}
+			} else {
+				// Log termination by other signals.
+				LOG_I(
+				    "pid=%d (%s) terminated with signal: %s (%d), (PIDs left: %d)",
+				    pid, remote_txt.c_str(), util::sigName(sig).c_str(), sig,
+				    countProc(nsjconf) - 1);
+			}
 			removeProc(nsjconf, pid);
-			return 128 + WTERMSIG(status);
+			return 128 + sig;
 		}
+	}
+	// Return 0 if wait4 indicates process not ready (WNOHANG) or failed.
+	// If wait4 failed, the process wasn't reaped, so don't return an error code yet.
+	// If WNOHANG and process not exited, also return 0.
+	else if (errno != ECHILD) {  // ECHILD means the pid was already reaped or invalid -
+				     // expected sometimes with WNOHANG loop.
+		PLOG_W("wait4(pid=%d, should_wait=%d) failed", pid, should_wait);
 	}
 	return 0;
 }
